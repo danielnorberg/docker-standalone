@@ -1,0 +1,89 @@
+#!/bin/bash -e
+DOCKER=${DOCKER:=docker}
+
+IMAGE=$1
+shift
+
+# First pull image using persistent docker daemon if necessary
+if ! "$DOCKER" inspect "$IMAGE" &>/dev/null; then
+  "$DOCKER" pull "$IMAGE"
+fi
+
+# Set up standalone docker
+ORIGIN='/var/lib/docker'
+RAND=$(cat /dev/urandom | tr -cd 'a-f0-9' | head -c 32)
+PARENT='/var/lib/docker-standalone'
+ROOT="$PARENT/$RAND"
+GRAPH="$ROOT/graph"
+PIDFILE="$ROOT/docker.pid"
+CIDFILE="$ROOT/container.cid"
+SOCKET="unix://$ROOT/docker.sock"
+DAEMONLOG="$ROOT/docker.log"
+CLILOG="$ROOT/cli.log"
+echo "Starting standalone daemon: $ROOT"
+
+# Create the standalone root
+mkdir -p "$ROOT"
+
+# Symlink graph and docker init
+mkdir -p "$GRAPH"
+ln -s "$ORIGIN/graph" "$GRAPH/graph"
+ln -s "$ORIGIN/init" "$GRAPH/init"
+ln -s "$ORIGIN/repositories-aufs" "$GRAPH/repositories-aufs"
+
+# Symlink over all aufs layers etc
+for t in diff layers mnt; do
+  mkdir -p "$GRAPH/aufs/$t"
+  for d in $(ls "$ORIGIN/aufs/$t/"); do
+    ln -s "$ORIGIN/aufs/$t/$d" "$GRAPH/aufs/$t/$d"
+  done
+done
+
+# Start the standalone daemon
+"$DOCKER" --restart=false -D -d -g "$GRAPH" -p "$PIDFILE" -H "$SOCKET" &> "$DAEMONLOG" &
+
+for i in {1..30}; do
+  if "$DOCKER" -H "$SOCKET" version &>/dev/null; then
+    UP=1
+    break;
+  fi
+  sleep 1
+done
+if [[ ! $UP ]]; then
+  echo "Docker daemon failed to come up: $SOCKET"
+  exit 1
+fi
+
+# Set up cleanup trap
+function cleanup {
+  # Ignore errors during cleanup
+  set +e
+
+  echo "Killing container"
+  kill -9 $(cat "$PIDFILE" 2>/dev/null || true) 2>/dev/null
+  CONTAINERS=$(ls "$GRAPH/containers")
+  for CID in $CONTAINERS; do
+    for PID in $(cat "/sys/fs/cgroup/cpu/docker/$CID/cgroup.procs" 2>/dev/null); do
+      kill -9 $PID
+    done
+  done
+
+  echo "Removing daemon"
+  while true; do
+    for d in $(find "$GRAPH/aufs/" -maxdepth 2 \! -type l); do
+      umount $d 2>/dev/null
+    done
+    umount "$GRAPH/aufs/" 2>/dev/null
+    if rm -rf "$ROOT" 2>/dev/null; then
+      REMOVED=1
+      break
+    fi
+    sleep 1
+  done
+}
+trap cleanup EXIT
+
+# Start the container
+CID=$("$DOCKER" -H "$SOCKET" run -d "$IMAGE" "$@")
+echo "Started container: $IMAGE" "$@"
+"$DOCKER" -H "$SOCKET" wait "$CID"
